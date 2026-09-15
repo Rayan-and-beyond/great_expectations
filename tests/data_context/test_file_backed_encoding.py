@@ -37,6 +37,11 @@ NON_UTF8_ENV = dict(
 
 NON_ASCII_VALUE = "Prüfung ünïcödé Straße café naïve 中文测试"
 
+# A subset of NON_ASCII_VALUE restricted to characters cp1252 can represent (no CJK):
+# used to simulate a file a non-UTF-8-locale host's own codec actually produced, rather
+# than one written as UTF-8 and merely read back under a forced locale.
+NON_ASCII_VALUE_CP1252_SAFE = "Prüfung ünïcödé Straße café naïve"
+
 GITIGNORE_WITH_NON_ASCII = f"# Local ignores\n{NON_ASCII_VALUE}\n*.pyc\n"
 
 PROJECT_YAML_TEMPLATE = """config_version: 3.0
@@ -439,3 +444,59 @@ def test_config_variables_round_trip_non_ascii_value_under_non_utf8_locale(
 
     assert reload_result.returncode == 0, reload_result.stderr
     assert "OK" in reload_result.stdout
+
+
+@pytest.mark.filesystem
+def test_set_ge_config_version_breaks_same_host_round_trip_for_pre_existing_non_utf8_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """set_ge_config_version()'s read-modify-write is a distinct code path from
+    FileDataContext._load_file_backed_project_config()/_save_project_config(), which were
+    already pinned to UTF-8 before this fix landed. Before this fix, its bare open() pair
+    read and wrote great_expectations.yml using the process's ambient locale encoding, so
+    a file produced and only ever touched on a single host under one persistently
+    non-UTF-8 locale (e.g. hand-edited, or written by this same pre-fix code on a Windows
+    host whose codepage is cp1252) round-tripped correctly: both sides resolved to the
+    same codec.
+
+    This fix hard-pins the read side to UTF-8 regardless of what codec actually produced
+    the bytes on disk. The same, unchanged file on the same host now raises
+    UnicodeDecodeError instead of round-tripping. This is the regression raised in review
+    on https://github.com/fivetran/great_expectations/pull/12204 against
+    set_ge_config_version specifically -- the one site identified there as able to lose
+    data, since it is a write path, not merely a read.
+
+    Unlike the sibling tests in this module, this does not need the non-UTF-8-locale
+    subprocess harness: set_ge_config_version's read is now hard-pinned to UTF-8, so its
+    failure here does not depend on the *calling* process's locale at all -- only on the
+    codec that produced the bytes already on disk, which this test controls directly by
+    writing them with a non-UTF-8 codec up front.
+    """  # FIXME CoP
+    from great_expectations.data_context.data_context.serializable_data_context import (
+        SerializableDataContext,
+    )
+
+    project_root_dir = tmp_path / "project"
+    gx_dir = project_root_dir / "gx"
+    gx_dir.mkdir(parents=True)
+    yml_path = gx_dir / "great_expectations.yml"
+
+    # Simulate a great_expectations.yml this same bare open() pair itself produced,
+    # pre-fix, under a persistently non-UTF-8 locale -- written directly with that
+    # locale's codec, not through UTF-8-pinned code.
+    non_utf8_codec = "cp1252"
+    yml_path.write_bytes(
+        PROJECT_YAML_TEMPLATE.format(value=NON_ASCII_VALUE_CP1252_SAFE).encode(non_utf8_codec)
+    )
+
+    # Pre-fix (and on this same host/locale), this call round-tripped correctly. Post-fix,
+    # it raises UnicodeDecodeError instead -- this assertion is the regression.
+    got = SerializableDataContext.set_ge_config_version(3.1, context_root_dir=str(project_root_dir))
+
+    assert got is True
+
+    written = yml_path.read_bytes()
+    assert NON_ASCII_VALUE_CP1252_SAFE.encode(non_utf8_codec) in written, (
+        "the rewrite dropped or corrupted the pre-existing non-ASCII config"
+    )
+    assert b"config_version: 3.1" in written, "the version bump itself did not land"
