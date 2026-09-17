@@ -1026,12 +1026,26 @@ def test_is_fresh_raises_error_when_child_deps_not_found(in_memory_runtime_conte
     assert isinstance(diagnostics.errors[1], ExpectationSuiteNotFoundError)
 
 
+# Shorter than the per-test timeout the suite runs under, so a thread that never gets its
+# turn unwinds and reports inside its own test instead of being left behind for the next one.
+_CONCURRENT_RUN_WAIT_SECONDS = 1.0
+
+
 class TestConcurrentValidationRuns:
     """Two ValidationDefinitions on one datasource share its cached execution engine.
 
     The interleaving these tests force is the one a thread pool produces on its own: both
     Validators exist before either builds its metric graph (or assembles its result). A
     barrier makes it deterministic; it does not create the shared state.
+
+    Where the sync points sit matters on Python 3.10 and 3.11. The wrapped Validator is built
+    under ``V1Validator._wrapped_validator``, a ``functools.cached_property`` whose ``__get__``
+    holds one class-wide lock while it computes on those versions (3.12 removed the lock). A
+    thread that waits for the other thread *inside* that computation holds the lock the other
+    thread needs to build its own Validator, and both hang. So a wait for the other thread's
+    Validator goes at ``graph_validate``, the first call after the property has been computed,
+    and the one wait that must sit inside ``__init__`` only ever waits on a thread whose
+    Validator already exists.
     """
 
     @staticmethod
@@ -1049,12 +1063,15 @@ class TestConcurrentValidationRuns:
                 errors[name] = e
 
         threads = [
-            threading.Thread(target=run, args=(name,), name=name) for name in validation_definitions
+            threading.Thread(target=run, args=(name,), name=name, daemon=True)
+            for name in validation_definitions
         ]
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=30)
+            thread.join(timeout=_CONCURRENT_RUN_WAIT_SECONDS + 0.5)
+        stuck = [thread.name for thread in threads if thread.is_alive()]
+        assert not stuck, f"threads still running after the wait budget: {stuck}"
         assert not errors, errors
         assert set(results) == set(validation_definitions)
         return results
@@ -1077,13 +1094,17 @@ class TestConcurrentValidationRuns:
         monkeypatch: pytest.MonkeyPatch,
     ):
         both_built = threading.Barrier(2)
-        original_init = OldValidator.__init__
+        original_graph_validate = OldValidator.graph_validate
 
-        def init_then_wait_for_the_other(self, *args, **kwargs) -> None:
-            original_init(self, *args, **kwargs)
-            both_built.wait(timeout=30)
+        def wait_for_the_other_validator_then_build_the_graph(self, *args, **kwargs):
+            # This thread's Validator exists by the time it gets here; the barrier holds its
+            # graph build until the other thread's Validator exists too.
+            both_built.wait(timeout=_CONCURRENT_RUN_WAIT_SECONDS)
+            return original_graph_validate(self, *args, **kwargs)
 
-        monkeypatch.setattr(OldValidator, "__init__", init_then_wait_for_the_other)
+        monkeypatch.setattr(
+            OldValidator, "graph_validate", wait_for_the_other_validator_then_build_the_graph
+        )
 
         results = self._run_on_threads(two_dataframe_validation_definitions)
 
@@ -1103,8 +1124,10 @@ class TestConcurrentValidationRuns:
         original_graph_validate = OldValidator.graph_validate
 
         def init_big_after_small_resolves(self, *args, **kwargs) -> None:
+            # Waits inside the cached-property computation, which is safe here: "small"'s
+            # Validator already exists, so "small" never needs that lock again.
             if threading.current_thread().name == "big":
-                assert small_resolved.wait(timeout=30)
+                assert small_resolved.wait(timeout=_CONCURRENT_RUN_WAIT_SECONDS)
             original_init(self, *args, **kwargs)
             if threading.current_thread().name == "big":
                 big_built.set()
@@ -1113,7 +1136,7 @@ class TestConcurrentValidationRuns:
             result = original_graph_validate(self, *args, **kwargs)
             if threading.current_thread().name == "small":
                 small_resolved.set()
-                assert big_built.wait(timeout=30)
+                assert big_built.wait(timeout=_CONCURRENT_RUN_WAIT_SECONDS)
             return result
 
         monkeypatch.setattr(OldValidator, "__init__", init_big_after_small_resolves)
