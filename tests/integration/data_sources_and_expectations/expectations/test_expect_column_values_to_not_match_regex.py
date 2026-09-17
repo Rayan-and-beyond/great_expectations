@@ -18,6 +18,7 @@ from tests.integration.test_utils.data_source_config import (
     PandasFilesystemCsvDatasourceTestConfig,
     PostgreSQLDatasourceTestConfig,
     RedshiftDatasourceTestConfig,
+    SnowflakeDatasourceTestConfig,
     SparkFilesystemCsvDatasourceTestConfig,
     SqliteDatasourceTestConfig,
 )
@@ -32,6 +33,20 @@ DATA = pd.DataFrame(
         COL_B: ["aa", "bb", "cc", None],
     }
 )
+
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=[SnowflakeDatasourceTestConfig()], data=DATA
+)
+def test_unanchored_regex_matches_anywhere_in_value_snowflake(
+    batch_for_datasource: Batch,
+) -> None:
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnValuesToNotMatchRegex(column=COL_A, regex="^a")
+    )
+    assert result.result["unexpected_count"] == 3
+    assert not result.success
+
 
 SUPPORTED_DATA_SOURCES: Sequence[DataSourceTestConfig] = [
     PandasDataFrameDatasourceTestConfig(),

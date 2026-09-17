@@ -35,6 +35,20 @@ DATA = pd.DataFrame(
     }
 )
 
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=[SnowflakeDatasourceTestConfig()], data=DATA
+)
+def test_unanchored_regex_list_matches_anywhere_in_value_snowflake(
+    batch_for_datasource: Batch,
+) -> None:
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnValuesToNotMatchRegexList(column=COL_A, regex_list=["^a"])
+    )
+    assert result.result["unexpected_count"] == 3
+    assert not result.success
+
+
 SUPPORTED_DATA_SOURCES: Sequence[DataSourceTestConfig] = [
     PandasDataFrameDatasourceTestConfig(),
     PandasFilesystemCsvDatasourceTestConfig(),
