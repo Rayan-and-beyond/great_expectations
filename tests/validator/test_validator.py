@@ -24,6 +24,7 @@ from great_expectations.data_context.data_context.file_data_context import (
     FileDataContext,
 )
 from great_expectations.data_context.util import file_relative_path
+from great_expectations.datasource.fluent.interfaces import Batch as FluentBatch
 from great_expectations.execution_engine import PandasExecutionEngine
 from great_expectations.expectations.expectation_configuration import (
     ExpectationConfiguration,
@@ -135,6 +136,101 @@ def yellow_trip_pandas_data_context(
     assert context.root_directory == context_path
 
     return context
+
+
+@pytest.fixture
+def two_validators_on_one_engine(
+    basic_datasource: PandasDatasource,
+) -> tuple[Validator, Validator]:
+    """Two Validators over two assets of one datasource, built in order.
+
+    Every Validator built on a datasource shares that datasource's cached execution engine,
+    whose BatchManager keeps a single "active" slot that the most recent load overwrites.
+    Building the second Validator is therefore exactly the event that used to redirect the
+    first one onto the second's Batch.
+    """
+    context = basic_datasource.data_context
+    assert context is not None
+    validators = []
+    for name, rows in (("small", 3), ("big", 10)):
+        asset = basic_datasource.add_dataframe_asset(name)
+        batch_definition = asset.add_batch_definition_whole_dataframe("whole")
+        batch_request = batch_definition.build_batch_request(
+            {"dataframe": pd.DataFrame({"x": range(rows)})}
+        )
+        validators.append(context.get_validator(batch_request=batch_request))
+    small, big = validators
+    assert small.execution_engine is big.execution_engine, "precondition: the engine is shared"
+    return small, big
+
+
+@pytest.mark.unit
+def test_validator_keeps_its_own_batch_when_another_validator_shares_the_engine(
+    two_validators_on_one_engine: tuple[Validator, Validator],
+):
+    small, big = two_validators_on_one_engine
+
+    assert small.active_batch_id == "my_datasource-small"
+    assert big.active_batch_id == "my_datasource-big"
+    assert isinstance(small.active_batch, FluentBatch)
+    assert small.active_batch.data_asset.name == "small"
+    assert small.active_batch_definition is not None
+    assert small.active_batch_definition.data_asset_name == "small"
+    assert small.loaded_batch_ids == ["my_datasource-small"]
+    assert list(small.batch_cache) == ["my_datasource-small"]
+    assert small.active_batch_data is small.active_batch.data
+
+
+@pytest.mark.unit
+def test_validator_validates_its_own_batch_when_another_validator_shares_the_engine(
+    two_validators_on_one_engine: tuple[Validator, Validator],
+):
+    small, _big = two_validators_on_one_engine
+
+    # expect_table_row_count_to_equal is one of the expectations whose domain_keys omit
+    # batch_id, so its metric only reaches the right Batch if the Validator supplies it.
+    result = small.graph_validate(
+        configurations=[
+            ExpectationConfiguration(type="expect_table_row_count_to_equal", kwargs={"value": 3})
+        ]
+    )[0]
+
+    assert result.success is True
+    assert result.result["observed_value"] == 3
+    assert result.expectation_config is not None
+    assert result.expectation_config.kwargs["batch_id"] == "my_datasource-small"
+
+
+@pytest.mark.unit
+def test_validator_columns_and_head_read_its_own_batch_when_the_engine_is_shared(
+    two_validators_on_one_engine: tuple[Validator, Validator],
+):
+    small, _big = two_validators_on_one_engine
+
+    assert small.columns() == ["x"]
+    assert len(small.head(fetch_all=True)) == 3
+
+
+@pytest.mark.unit
+def test_validator_load_batch_list_makes_the_last_loaded_batch_active(
+    basic_datasource: PandasDatasource,
+):
+    context = basic_datasource.data_context
+    assert context is not None
+    batches = []
+    for name in ("first", "second"):
+        asset = basic_datasource.add_dataframe_asset(name)
+        batch_definition = asset.add_batch_definition_whole_dataframe("whole")
+        batches.append(batch_definition.get_batch({"dataframe": pd.DataFrame({"x": [1]})}))
+    first, second = batches
+
+    validator = Validator(execution_engine=PandasExecutionEngine(), batches=[first])
+    assert validator.active_batch_id == first.id
+
+    validator.load_batch_list([second])
+    assert validator.active_batch_id == second.id
+    assert validator.loaded_batch_ids == [first.id, second.id]
+    assert validator.batch_cache == {first.id: first, second.id: second}
 
 
 @pytest.mark.big
