@@ -103,9 +103,9 @@ class TestNormalSql:
 )
 def test_unanchored_regex_matches_substring_snowflake(batch_for_datasource: Batch) -> None:
     result = batch_for_datasource.validate(
-        gxe.ExpectColumnValuesToNotMatchRegex(column=COL_A, regex="^a")
+        gxe.ExpectColumnValuesToNotMatchRegex(column=COL_B, regex="a")
     )
-    assert result.result["unexpected_count"] == 3
+    assert result.result["unexpected_count"] == 1
     assert not result.success
 
 

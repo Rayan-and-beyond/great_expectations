@@ -54,9 +54,9 @@ SUPPORTED_DATA_SOURCES: Sequence[DataSourceTestConfig] = [
 )
 def test_unanchored_regex_matches_substring_snowflake(batch_for_datasource: Batch) -> None:
     result = batch_for_datasource.validate(
-        gxe.ExpectColumnValuesToNotMatchRegexList(column=COL_A, regex_list=["^a"])
+        gxe.ExpectColumnValuesToNotMatchRegexList(column=COL_B, regex_list=["a"])
     )
-    assert result.result["unexpected_count"] == 3
+    assert result.result["unexpected_count"] == 1
     assert not result.success
 
 
